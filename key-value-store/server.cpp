@@ -111,6 +111,7 @@ int main(){
                 response = "Ok\n";
             }
         }
+
         else if(clientMessage.rfind("GET " , 0) == 0){
             string key = clientMessage.substr(4);
 
@@ -118,6 +119,39 @@ int main(){
                 response = database[key] + "\n";
             }else{
                 response = "ERR key not found\n";
+            }
+        }
+
+        else if(clientMessage.rfind("EXISTS " , 0) == 0){
+            string key = clientMessage.substr(7);
+
+            if(database.find(key) != database.end()){
+                response = "1\n";
+            }else{
+                response = "0\n";
+            }
+        }
+
+        else if(clientMessage.rfind("DEL " , 0) == 0){
+            string key = clientMessage.substr(4);
+
+            if(database.erase(key)) response = "1\n";
+            else response = "0\n";
+        }
+
+        else if(clientMessage == "KEYS"){
+            if(database.empty()) response = "(Empty List)\n";
+            else{
+                string allKeys = "";
+                for(const auto& p : database){
+                    allKeys += p.first;
+                    allKeys += " , ";
+                }
+
+                if(!allKeys.empty()){
+                    for(int i = 0 ; i < 3 ; i++) allKeys.pop_back();
+                    response = allKeys + "\n";
+                }
             }
         }
 
