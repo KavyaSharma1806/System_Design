@@ -3,12 +3,55 @@
 #include <ws2tcpip.h>
 #include <unordered_map>
 #include <string>
+#include <fstream>
 
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
 
+unordered_map<string , string> database; // database storage for key -> value
+
+
+//WAL replay (one time heavy work)
+void replayLogFile(){
+    ifstream logFile("database.log");
+    if(!logFile){
+        cout << "STARTUP : No log file found. Starting with a fresh db.\n";
+        return;
+    }
+
+    cout << "STARTUP: Found database.log. Replaying transactions to rebuild RAM...\n";
+    string cmd , key , val;
+    int cmdReplayed = 0;
+
+    while(logFile >> cmd){
+        if(cmd =="SET"){
+            logFile >> key >> val;
+            database[key] = val;
+            cmdReplayed++;
+        } else if(cmd == "DEL"){
+            logFile >> key;
+            database.erase(key);
+            cmdReplayed++;
+        }
+    }
+
+    logFile.close();
+    cout << "STARTUP: Successfully replayed " << cmdReplayed << "commands from disk.\n";
+}
+
+//WAL append
+void appendToLog(const string& transaction){
+    ofstream logFile("database.log" , ios :: app);
+    if(logFile){
+        logFile << transaction << "\n";
+        logFile.close();
+    }
+}
+
 int main(){
+
+    replayLogFile();
 
     //1. Initialize winsock
 
@@ -55,112 +98,116 @@ int main(){
         WSACleanup();
         return 1;
     }
-    cout << "4. Server is now listening on port 8080... (Waiting for client)\n";
+    cout << "4. Server is now listening on port 8080\n";
 
     //5. Accept connection
     
-    sockaddr_in clientHint;
-    int clientSize = sizeof(clientHint);
-
-    SOCKET clientSocket = accept(listenSocket , (sockaddr*)&clientHint , &clientSize);
-    if(clientSocket == INVALID_SOCKET){
-        cerr << "Accepting client connnection failed. Error : " << WSAGetLastError() << endl;
-        closesocket(listenSocket);
-        WSACleanup();
-        return 1;
-    }
-
-    cout << "5. Client connnected successfully.\n";
-
-    unordered_map<string , string> database; // database storage for key -> value
-
-    char buffer[4096]; //to hold incoming raw bytes
-
     while(true){
-        ZeroMemory(&buffer , 4096);
+        cout << "Waiting for client. \n";
+        
+        sockaddr_in clientHint;
+        int clientSize = sizeof(clientHint);
 
-        int bytesReceived = recv(clientSocket , buffer , 4096 , 0);
-
-        if(bytesReceived == SOCKET_ERROR){
-            cerr << "Error in recv(). Quiting.\n";
-            break;
+        SOCKET clientSocket = accept(listenSocket , (sockaddr*)&clientHint , &clientSize);
+        if(clientSocket == INVALID_SOCKET){
+            cerr << "Accepting client connnection failed. Error : " << WSAGetLastError() << endl;
+            closesocket(listenSocket);
+            WSACleanup();
+            return 1;
         }
 
-        if(!bytesReceived){
-            cout << "Client disconnected gracefully.\n";
-            break;
-        }
+        cout << "5. Client connnected successfully.\n";
 
-        //raw bytes to string
-        string clientMessage(buffer , bytesReceived);
-        cout << "Received raw command : " << clientMessage << endl;
+        char buffer[4096]; //to hold incoming raw bytes
 
-        //Basic parsing
-        //expected SET key value or GET  key value
-        string response = "ERR unknown command\n";
+        while(true){
+            ZeroMemory(&buffer , 4096);
 
-        if(clientMessage.rfind("SET ", 0) == 0){
-            size_t firstSpace = clientMessage.find(' ');
-            size_t secondSpace = clientMessage.find(' ' , firstSpace + 1);
+            int bytesReceived = recv(clientSocket , buffer , 4096 , 0);
 
-            if(secondSpace != string :: npos){
-                string key = clientMessage.substr(firstSpace + 1 , secondSpace - firstSpace - 1);
-                string value = clientMessage.substr(secondSpace + 1);
-
-                database[key] = value;
-                response = "Ok\n";
+            if(bytesReceived == SOCKET_ERROR){
+                cerr << "Error in recv(). Quiting.\n";
+                break;
             }
-        }
 
-        else if(clientMessage.rfind("GET " , 0) == 0){
-            string key = clientMessage.substr(4);
-
-            if(database.find(key) != database.end()){
-                response = database[key] + "\n";
-            }else{
-                response = "ERR key not found\n";
+            if(!bytesReceived){
+                cout << "Client disconnected gracefully.\n";
+                break;
             }
-        }
 
-        else if(clientMessage.rfind("EXISTS " , 0) == 0){
-            string key = clientMessage.substr(7);
+            //raw bytes to string
+            string clientMessage(buffer , bytesReceived);
+            cout << "Received raw command : " << clientMessage << endl;
 
-            if(database.find(key) != database.end()){
-                response = "1\n";
-            }else{
-                response = "0\n";
-            }
-        }
+            //Basic parsing
+            //expected SET key value or GET  key value
+            string response = "ERR unknown command\n";
 
-        else if(clientMessage.rfind("DEL " , 0) == 0){
-            string key = clientMessage.substr(4);
+            if(clientMessage.rfind("SET ", 0) == 0){
+                size_t firstSpace = clientMessage.find(' ');
+                size_t secondSpace = clientMessage.find(' ' , firstSpace + 1);
 
-            if(database.erase(key)) response = "1\n";
-            else response = "0\n";
-        }
+                if(secondSpace != string :: npos){
+                    string key = clientMessage.substr(firstSpace + 1 , secondSpace - firstSpace - 1);
+                    string value = clientMessage.substr(secondSpace + 1);
 
-        else if(clientMessage == "KEYS"){
-            if(database.empty()) response = "(Empty List)\n";
-            else{
-                string allKeys = "";
-                for(const auto& p : database){
-                    allKeys += p.first;
-                    allKeys += " , ";
-                }
-
-                if(!allKeys.empty()){
-                    for(int i = 0 ; i < 3 ; i++) allKeys.pop_back();
-                    response = allKeys + "\n";
+                    database[key] = value;
+                    response = "Ok\n";
                 }
             }
-        }
 
-        send(clientSocket , response.c_str() , response.size() , 0);
+            else if(clientMessage.rfind("GET " , 0) == 0){
+                string key = clientMessage.substr(4);
+
+                if(database.find(key) != database.end()){
+                    response = database[key] + "\n";
+                }else{
+                    response = "ERR key not found\n";
+                }
+            }
+
+            else if(clientMessage.rfind("EXISTS " , 0) == 0){
+                string key = clientMessage.substr(7);
+
+                if(database.find(key) != database.end()){
+                    response = "1\n";
+                }else{
+                    response = "0\n";
+                }
+            }
+
+            else if(clientMessage.rfind("DEL " , 0) == 0){
+                string key = clientMessage.substr(4);
+
+                if(database.erase(key)) response = "1\n";
+                else response = "0\n";
+            }
+
+            else if(clientMessage == "KEYS"){
+                if(database.empty()) response = "(Empty List)\n";
+                else{
+                    string allKeys = "";
+                    for(const auto& p : database){
+                        allKeys += p.first;
+                        allKeys += " , ";
+                    }
+
+                    if(!allKeys.empty()){
+                        for(int i = 0 ; i < 3 ; i++) allKeys.pop_back();
+                        response = allKeys + "\n";
+                    }
+                }
+            }
+
+            send(clientSocket , response.c_str() , response.size() , 0);
+        }
+        closesocket(clientSocket); //cleanup current client socket
+        cout << "Session closed. Resetting for next customer." << endl;
     }
-
+    
     //6. cleanup - just close sockets and turn off winsock
     
-    closesocket(clientSocket);
+    
     closesocket(listenSocket);
     WSACleanup();
     cout << "Server shutdown cleanly.\n";
