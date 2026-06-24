@@ -4,13 +4,23 @@
 #include <unordered_map>
 #include <string>
 #include <fstream>
+#include <thread>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
 
-unordered_map<string , string> database; // database storage for key -> value
 
+
+unordered_map<string , string> database; // database storage for key -> value
+mutex dbMutex;
+
+void trimTrailing(string& str){
+    while(!str.empty() && (str.back() == '\n' || str.back() == '\r')){
+        str.pop_back();
+    }
+}
 
 //WAL replay (one time heavy work)
 void replayLogFile(){
@@ -21,23 +31,25 @@ void replayLogFile(){
     }
 
     cout << "STARTUP: Found database.log. Replaying transactions to rebuild RAM...\n";
-    string cmd , key , val;
-    int cmdReplayed = 0;
+    string line;
+    while (getline(logFile, line)) {
+        trimTrailing(line);
+        if (line.empty()) continue;
 
-    while(logFile >> cmd){
-        if(cmd =="SET"){
-            logFile >> key >> val;
-            database[key] = val;
-            cmdReplayed++;
-        } else if(cmd == "DEL"){
-            logFile >> key;
+        if (line.rfind("SET ", 0) == 0) {
+            size_t firstSpace = line.find(' ');
+            size_t secondSpace = line.find(' ', firstSpace + 1);
+            if (secondSpace != string::npos) {
+                string key = line.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+                string value = line.substr(secondSpace + 1);
+                database[key] = value;
+            }
+        } else if (line.rfind("DEL ", 0) == 0) {
+            string key = line.substr(4);
             database.erase(key);
-            cmdReplayed++;
         }
     }
-
     logFile.close();
-    cout << "STARTUP: Successfully replayed " << cmdReplayed << "commands from disk.\n";
 }
 
 //WAL append
@@ -47,6 +59,112 @@ void appendToLog(const string& transaction){
         logFile << transaction << "\n";
         logFile.close();
     }
+}
+
+void handleClient(SOCKET clientSocket){
+    char buffer[4096]; //to hold incoming raw bytes
+
+    while(true){
+        ZeroMemory(&buffer , 4096);
+        int bytesReceived = recv(clientSocket , buffer , 4096 , 0);
+
+        if(bytesReceived == SOCKET_ERROR){
+            cerr << "Error in recv(). Quiting.\n";
+            break;
+        }
+
+        if(!bytesReceived){
+            cout << "Client disconnected gracefully.\n";
+            break;
+        }
+
+        //raw bytes to string
+        string clientMessage(buffer , bytesReceived);
+        cout << "Received raw command : " << clientMessage << endl;
+
+        //Basic parsing
+        //expected SET key value or GET  key value
+        string response = "ERR unknown command\n";
+
+        if(clientMessage.rfind("SET ", 0) == 0){
+            size_t firstSpace = clientMessage.find(' ');
+            size_t secondSpace = clientMessage.find(' ' , firstSpace + 1);
+
+            if(secondSpace != string :: npos){
+                string key = clientMessage.substr(firstSpace + 1 , secondSpace - firstSpace - 1);
+                string value = clientMessage.substr(secondSpace + 1);
+
+                {
+                    lock_guard<mutex> guard(dbMutex);
+                    appendToLog("SET " + key + " " + value);
+                    database[key] = value;
+                }
+
+                response = "Ok\n";
+            }
+        }
+
+        else if(clientMessage.rfind("GET " , 0) == 0){
+            string key = clientMessage.substr(4);
+
+            {
+                lock_guard<mutex> guard(dbMutex);
+
+                auto it = database.find(key);
+                if(it != database.end()){
+                    response = it -> second + "\n";
+                }else{
+                    response = "ERR key not found.\n";
+                }
+            }
+        }
+
+        else if(clientMessage.rfind("EXISTS " , 0) == 0){
+            string key = clientMessage.substr(7);
+
+            {
+                lock_guard<mutex> guard(dbMutex);
+                auto it = database.find(key);
+                response = (it != database.end()) ? "1\n" : "0\n";
+            }
+        }
+
+        else if(clientMessage.rfind("DEL " , 0) == 0){
+            string key = clientMessage.substr(4);
+
+            {
+                lock_guard<mutex> guard(dbMutex);
+                auto it = database.find(key);
+                if (it != database.end()) {
+                    appendToLog("DEL " + key);
+                    database.erase(it);
+                    response = "1\n";
+                } else {
+                    response = "0\n";
+                }
+            }
+        }
+
+        else if(clientMessage == "KEYS"){
+            {
+                lock_guard<mutex> guard(dbMutex);
+                if (database.empty()) {
+                    response = "(empty list)\n";
+                } else {
+                    string allKeys = "";
+                    for (auto const& p : database) {
+                        allKeys += p.first + " ";
+                    }
+                    if (!allKeys.empty()) allKeys.pop_back();
+                    response = allKeys + "\n";
+                }
+            }
+        }
+
+        send(clientSocket , response.c_str() , response.size() , 0);
+    }
+    closesocket(clientSocket); //cleanup current client socket
+    cout << "Session closed." << endl;
 }
 
 int main(){
@@ -104,109 +222,25 @@ int main(){
     
     while(true){
         cout << "Waiting for client. \n";
-        
+
         sockaddr_in clientHint;
         int clientSize = sizeof(clientHint);
-
         SOCKET clientSocket = accept(listenSocket , (sockaddr*)&clientHint , &clientSize);
+
         if(clientSocket == INVALID_SOCKET){
             cerr << "Accepting client connnection failed. Error : " << WSAGetLastError() << endl;
             closesocket(listenSocket);
             WSACleanup();
             return 1;
+        } else {
+            thread worker(handleClient , clientSocket);
+            worker.detach();
         }
 
         cout << "5. Client connnected successfully.\n";
-
-        char buffer[4096]; //to hold incoming raw bytes
-
-        while(true){
-            ZeroMemory(&buffer , 4096);
-
-            int bytesReceived = recv(clientSocket , buffer , 4096 , 0);
-
-            if(bytesReceived == SOCKET_ERROR){
-                cerr << "Error in recv(). Quiting.\n";
-                break;
-            }
-
-            if(!bytesReceived){
-                cout << "Client disconnected gracefully.\n";
-                break;
-            }
-
-            //raw bytes to string
-            string clientMessage(buffer , bytesReceived);
-            cout << "Received raw command : " << clientMessage << endl;
-
-            //Basic parsing
-            //expected SET key value or GET  key value
-            string response = "ERR unknown command\n";
-
-            if(clientMessage.rfind("SET ", 0) == 0){
-                size_t firstSpace = clientMessage.find(' ');
-                size_t secondSpace = clientMessage.find(' ' , firstSpace + 1);
-
-                if(secondSpace != string :: npos){
-                    string key = clientMessage.substr(firstSpace + 1 , secondSpace - firstSpace - 1);
-                    string value = clientMessage.substr(secondSpace + 1);
-
-                    database[key] = value;
-                    response = "Ok\n";
-                }
-            }
-
-            else if(clientMessage.rfind("GET " , 0) == 0){
-                string key = clientMessage.substr(4);
-
-                if(database.find(key) != database.end()){
-                    response = database[key] + "\n";
-                }else{
-                    response = "ERR key not found\n";
-                }
-            }
-
-            else if(clientMessage.rfind("EXISTS " , 0) == 0){
-                string key = clientMessage.substr(7);
-
-                if(database.find(key) != database.end()){
-                    response = "1\n";
-                }else{
-                    response = "0\n";
-                }
-            }
-
-            else if(clientMessage.rfind("DEL " , 0) == 0){
-                string key = clientMessage.substr(4);
-
-                if(database.erase(key)) response = "1\n";
-                else response = "0\n";
-            }
-
-            else if(clientMessage == "KEYS"){
-                if(database.empty()) response = "(Empty List)\n";
-                else{
-                    string allKeys = "";
-                    for(const auto& p : database){
-                        allKeys += p.first;
-                        allKeys += " , ";
-                    }
-
-                    if(!allKeys.empty()){
-                        for(int i = 0 ; i < 3 ; i++) allKeys.pop_back();
-                        response = allKeys + "\n";
-                    }
-                }
-            }
-
-            send(clientSocket , response.c_str() , response.size() , 0);
-        }
-        closesocket(clientSocket); //cleanup current client socket
-        cout << "Session closed. Resetting for next customer." << endl;
     }
     
     //6. cleanup - just close sockets and turn off winsock
-    
     
     closesocket(listenSocket);
     WSACleanup();
