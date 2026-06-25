@@ -6,15 +6,24 @@
 #include <fstream>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
+#include <queue>
+#include <condition_variable>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
 
-
-
 unordered_map<string , string> database; // database storage for key -> value
-mutex dbMutex;
+shared_mutex dbMutex;
+ofstream walStream;
+
+//pool state
+queue<SOCKET> taskQueue;
+mutex queueMutex;
+condition_variable cv;
+bool stopPool = false;
 
 void trimTrailing(string& str){
     while(!str.empty() && (str.back() == '\n' || str.back() == '\r')){
@@ -54,10 +63,9 @@ void replayLogFile(){
 
 //WAL append
 void appendToLog(const string& transaction){
-    ofstream logFile("database.log" , ios :: app);
-    if(logFile){
-        logFile << transaction << "\n";
-        logFile.close();
+    if(walStream.is_open()){
+        walStream << transaction << "\n";
+        walStream.flush();
     }
 }
 
@@ -69,12 +77,12 @@ void handleClient(SOCKET clientSocket){
         int bytesReceived = recv(clientSocket , buffer , 4096 , 0);
 
         if(bytesReceived == SOCKET_ERROR){
-            cerr << "Error in recv(). Quiting.\n";
+            cerr << "[Worker thread] Error in recv() with network error : " << WSAGetLastError << endl;
             break;
         }
 
         if(!bytesReceived){
-            cout << "Client disconnected gracefully.\n";
+            cout << "[Worker thread] Client disconnected gracefully.\n";
             break;
         }
 
@@ -95,7 +103,7 @@ void handleClient(SOCKET clientSocket){
                 string value = clientMessage.substr(secondSpace + 1);
 
                 {
-                    lock_guard<mutex> guard(dbMutex);
+                    unique_lock<shared_mutex> writeLock(dbMutex);
                     appendToLog("SET " + key + " " + value);
                     database[key] = value;
                 }
@@ -108,7 +116,7 @@ void handleClient(SOCKET clientSocket){
             string key = clientMessage.substr(4);
 
             {
-                lock_guard<mutex> guard(dbMutex);
+                shared_lock<shared_mutex> readLock(dbMutex);
 
                 auto it = database.find(key);
                 if(it != database.end()){
@@ -123,7 +131,7 @@ void handleClient(SOCKET clientSocket){
             string key = clientMessage.substr(7);
 
             {
-                lock_guard<mutex> guard(dbMutex);
+                shared_lock<shared_mutex> readLock(dbMutex);
                 auto it = database.find(key);
                 response = (it != database.end()) ? "1\n" : "0\n";
             }
@@ -133,7 +141,7 @@ void handleClient(SOCKET clientSocket){
             string key = clientMessage.substr(4);
 
             {
-                lock_guard<mutex> guard(dbMutex);
+                unique_lock<shared_mutex> writeLock(dbMutex);
                 auto it = database.find(key);
                 if (it != database.end()) {
                     appendToLog("DEL " + key);
@@ -147,7 +155,7 @@ void handleClient(SOCKET clientSocket){
 
         else if(clientMessage == "KEYS"){
             {
-                lock_guard<mutex> guard(dbMutex);
+                shared_lock<shared_mutex> readLock(dbMutex);
                 if (database.empty()) {
                     response = "(empty list)\n";
                 } else {
@@ -161,15 +169,47 @@ void handleClient(SOCKET clientSocket){
             }
         }
 
-        send(clientSocket , response.c_str() , response.size() , 0);
+        int sendResult = send(clientSocket , response.c_str() , response.size() , 0);
+        if(sendResult == SOCKET_ERROR){
+            cerr << "[Worker thread] send() failed with network error : " << WSAGetLastError() << endl;
+            break;
+        }
     }
     closesocket(clientSocket); //cleanup current client socket
     cout << "Session closed." << endl;
 }
 
+void poolWorkerLoop(){
+    while(true){
+        SOCKET clientSocket = INVALID_SOCKET;
+
+        {
+            unique_lock<mutex> lock(queueMutex);
+
+            //puts thread to sleep until que is empty
+            cv.wait(lock , []{return !taskQueue.empty() || stopPool;});
+
+            if(stopPool && taskQueue.empty()) return;
+
+            clientSocket = taskQueue.front();
+            taskQueue.pop();
+        }
+
+        if(clientSocket != INVALID_SOCKET){
+            handleClient(clientSocket);
+        }
+    }
+}
+
 int main(){
 
     replayLogFile();
+
+    walStream.open("database.log" , ios :: app);
+    if(!walStream){
+        cerr << "CRITICAL : Coudn't open WAL storage.\n";
+        return 1;
+    }
 
     //1. Initialize winsock
 
@@ -219,7 +259,16 @@ int main(){
     cout << "4. Server is now listening on port 8080\n";
 
     //5. Accept connection
-    
+
+    //thread pool intialization(cap thread usageto physical machine capabilities)
+    const int THREAD_POOL_SIZE = 4;
+    vector<thread> pool;
+    for(int i = 0 ; i < THREAD_POOL_SIZE ; i++){
+        pool.emplace_back(poolWorkerLoop);
+    }
+
+    cout << "Thread pool running with " << THREAD_POOL_SIZE << " static worker handles.\n\n";
+
     while(true){
         cout << "Waiting for client. \n";
 
@@ -233,15 +282,18 @@ int main(){
             WSACleanup();
             return 1;
         } else {
-            thread worker(handleClient , clientSocket);
-            worker.detach();
+            {
+                lock_guard<mutex> lock(queueMutex);
+                taskQueue.push(clientSocket);
+            }
+        cv.notify_one(); //wake up exactly one thread
         }
 
         cout << "5. Client connnected successfully.\n";
     }
     
     //6. cleanup - just close sockets and turn off winsock
-    
+    if(walStream.is_open()) walStream.close();  
     closesocket(listenSocket);
     WSACleanup();
     cout << "Server shutdown cleanly.\n";
